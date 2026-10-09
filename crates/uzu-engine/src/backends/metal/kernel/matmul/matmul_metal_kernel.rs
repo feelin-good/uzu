@@ -245,7 +245,16 @@ impl MatmulMetalKernel {
         command_buffer: &mut MetalCommandBufferEncoding,
     ) -> Result<(), MetalError> {
         let shape = MatmulShape::from_arguments(&arguments);
-        let plan = self.gemm.select_plan_for_engine(&shape, engine, command_buffer.context())?;
+        let plan = self.plan_for_gemm_engine(&shape, engine, command_buffer.context())?;
         self.gemm.encode_plan(arguments, plan, &self.output_work, command_buffer)
+    }
+
+    pub fn plan_for_gemm_engine(
+        &self,
+        shape: &MatmulShape,
+        engine: gemm::GemmEngine,
+        context: &MetalContext,
+    ) -> Result<GemmPlan, MetalError> {
+        self.gemm.select_plan_for_engine(shape, engine, context)
     }
 }

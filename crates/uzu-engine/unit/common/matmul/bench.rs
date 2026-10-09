@@ -1,11 +1,12 @@
 use std::{
     env,
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use criterion::Bencher;
+use serde_json::json;
 
 use super::super::env_vars;
 use crate::backends::common::{
@@ -14,6 +15,7 @@ use crate::backends::common::{
 };
 
 static CAPTURE_TAKEN: AtomicBool = AtomicBool::new(false);
+static SAMPLE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn should_capture_benchmark(benchmark_path: &str) -> bool {
     env_vars::enabled(env_vars::UZU_CAPTURE_BENCH)
@@ -72,6 +74,21 @@ pub fn iter_encode_loop_named<B: Backend, F>(
         if capture {
             context.stop_capture().expect("failed to stop benchmark GPU capture");
         }
-        completed.gpu_execution_time()
+        let gpu_time = completed.gpu_execution_time();
+        if benchmark_path.starts_with("Metal/Kernel/RegistryMatmul/") {
+            println!(
+                "{}",
+                json!({
+                    "record": "matmul_sample",
+                    "benchmark_path": benchmark_path,
+                    "iterations": n_iters,
+                    "gpu_ns": gpu_time.as_nanos() as u64,
+                    "instrumented": env_vars::enabled(env_vars::UZU_CAPTURE_BENCH) || env_vars::enabled("MTL_CAPTURE_ENABLED"),
+                    "pid": std::process::id(),
+                    "sequence": SAMPLE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                })
+            );
+        }
+        gpu_time
     });
 }
