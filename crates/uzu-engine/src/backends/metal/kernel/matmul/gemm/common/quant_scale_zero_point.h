@@ -20,8 +20,10 @@ template <
     short THREADGROUP_SIZE,
     short GROUP_SIZE,
     short BITS,
-    bool SCALE_SYMMETRIC = false>
+    bool SCALE_SYMMETRIC = false,
+    bool SCALE_BIAS = false>
 struct QuantizedBlockLoaderScaleZeroPoint {
+  static_assert(!(SCALE_SYMMETRIC && SCALE_BIAS), "scale+bias and symmetric quantization are exclusive");
   static_assert(THREADGROUP_TILE_COLS <= GROUP_SIZE, "Group size should be larger than columns");
   static_assert(GROUP_SIZE % THREADGROUP_TILE_COLS == 0, "Group size should be divisible by columns");
   static_assert(BITS == 4 || BITS == 8, "Only int4 and int8 supported");
@@ -34,6 +36,7 @@ struct QuantizedBlockLoaderScaleZeroPoint {
                                          : (THREADGROUP_TILE_COLS_PACKED * THREADGROUP_TILE_ROWS) / THREADGROUP_SIZE;
   UZU_CONST short GROUP_STEPS_PER_BLOCK = GROUP_SIZE / THREADGROUP_TILE_COLS;
   UZU_CONST bool TILE_HAS_IDLE_THREADS = THREADGROUP_TILE_COLS_PACKED * THREADGROUP_TILE_ROWS < THREADGROUP_SIZE;
+  using Correction = metal::conditional_t<SCALE_BIAS, const device T*, const device uint8_t*>;
 
   const int src_leading_dim;
   const int tile_stride;
@@ -48,14 +51,14 @@ struct QuantizedBlockLoaderScaleZeroPoint {
   threadgroup T* dst;
   const device uint8_t* src;
   const device T* scales;
-  const device uint8_t* zero_points_row_start;
+  Correction zero_points_row_start;
   uint zero_point_index;
   const bool signed_codes;
 
   QuantizedBlockLoaderScaleZeroPoint(
       const device uint8_t* src_,
       const device T* scales_,
-      const device uint8_t* zero_points_row_start_,
+      Correction zero_points_row_start_,
       const bool signed_codes_,
       const int src_leading_dim_,
       const int params_group_stride_,
@@ -75,7 +78,11 @@ struct QuantizedBlockLoaderScaleZeroPoint {
         dst(dst_ + tile_row_index * DESTINATION_LEADING_DIMENSION + tile_col_index * PACK_FACTOR),
         src(src_ + tile_row_index * src_leading_dim_ * BYTES_PER_PACK / PACK_FACTOR + tile_col_index * BYTES_PER_PACK),
         scales(scales_ + tile_row_index * params_output_stride_),
-        zero_points_row_start(SCALE_SYMMETRIC ? nullptr : zero_points_row_start_),
+        zero_points_row_start(
+            SCALE_SYMMETRIC ? nullptr
+            : SCALE_BIAS    ? zero_points_row_start_ + tile_row_index * params_output_stride_
+                            : zero_points_row_start_
+        ),
         zero_point_index(zero_point_index_ + uint(tile_row_index) * zero_point_output_stride_),
         signed_codes(signed_codes_) {}
 
@@ -93,7 +100,7 @@ struct QuantizedBlockLoaderScaleZeroPoint {
       : QuantizedBlockLoaderScaleZeroPoint(
             src_,
             scales_,
-            static_cast<const device uint8_t*>(nullptr),
+            static_cast<Correction>(nullptr),
             signed_codes_,
             src_leading_dim_,
             params_group_stride_,
@@ -108,10 +115,45 @@ struct QuantizedBlockLoaderScaleZeroPoint {
     static_assert(SCALE_SYMMETRIC, "zero-point-free loader construction requires symmetric quantization");
   }
 
+  QuantizedBlockLoaderScaleZeroPoint(
+      const device uint8_t* src_,
+      const device T* scales_,
+      const device T* biases_,
+      const bool signed_codes_,
+      const int src_leading_dim_,
+      const int params_group_stride_,
+      const int params_output_stride_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]]
+  )
+      : QuantizedBlockLoaderScaleZeroPoint(
+            src_,
+            scales_,
+            biases_,
+            signed_codes_,
+            src_leading_dim_,
+            params_group_stride_,
+            params_output_stride_,
+            0,
+            0,
+            0,
+            dst_,
+            simd_group_id,
+            simd_lane_id
+        ) {
+    static_assert(SCALE_BIAS, "bias loader construction requires scale+bias quantization");
+  }
+
   inline void current_scale_bias(thread T& out_scale, thread T& out_bias) const {
     uint zero_point_value;
     T scale_value;
     scale_value = *scales;
+    if constexpr (SCALE_BIAS) {
+      out_scale = scale_value;
+      out_bias = *zero_points_row_start;
+      return;
+    }
     if constexpr (SCALE_SYMMETRIC) {
       zero_point_value = symmetric_zero_point<ushort(BITS)>();
     } else {
@@ -185,7 +227,9 @@ struct QuantizedBlockLoaderScaleZeroPoint {
       group_step_counter = 0;
     }
     scales += group_stride;
-    if constexpr (!SCALE_SYMMETRIC) {
+    if constexpr (SCALE_BIAS) {
+      zero_points_row_start += group_stride;
+    } else if constexpr (!SCALE_SYMMETRIC) {
       zero_point_index += zero_point_group_stride;
     }
   }

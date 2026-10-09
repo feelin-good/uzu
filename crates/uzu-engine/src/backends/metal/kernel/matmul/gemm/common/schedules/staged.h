@@ -7,7 +7,6 @@
 #include "../../../common/fragment.h"
 #include "../gemm_alignment.h"
 #include "../operands.h"
-#include "../quant_scale_bias.h"
 #include "../quant_scale_zero_point.h"
 #include "tile_context.h"
 
@@ -38,14 +37,16 @@ static METAL_FUNC auto make_staged_loader(
                                      size_t(get_pack_factor<RightOperand::BITS>());
   if constexpr (RightOperand::SCHEME == GemmBPrologueKind::ScaleBiasDequant) {
     const device Element* biases = right.bias() + params_offset;
-    using Loader = QuantizedBlockLoaderScaleBias<
+    using Loader = QuantizedBlockLoaderScaleZeroPoint<
         Element,
         Core::THREADGROUP_BLOCK_N,
         Core::THREADGROUP_BLOCK_K,
         Core::SHARED_STRIDE_B,
         Core::THREADGROUP_THREADS,
         RightOperand::GROUP_SIZE,
-        RightOperand::BITS>;
+        RightOperand::BITS,
+        false,
+        true>;
     return Loader(
         values,
         scales,
