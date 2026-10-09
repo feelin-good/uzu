@@ -1,25 +1,14 @@
 mod error;
-mod kernel;
+mod gemm_engine;
+mod gemm_kernel;
+mod gemm_plan;
 mod policy;
 mod selection;
 mod specialization;
 mod trellis;
 
 pub use error::GemmSpecializationError;
-pub use kernel::GemmKernel;
-pub(super) use selection::GemmProblem;
-
-use crate::backends::common::gpu_types::gemm::GemmTiling;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GemmEngine {
-    Simdgroup,
-    Mxu,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GemmPlan {
-    pub(super) engine: GemmEngine,
-    pub(super) tiling: GemmTiling,
-    pub(super) split_k: u32,
-}
+pub use gemm_engine::GemmEngine;
+pub use gemm_kernel::GemmKernel;
+pub use gemm_plan::GemmPlan;
+pub use selection::GemmProblem;
