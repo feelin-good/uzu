@@ -54,7 +54,7 @@ static PASSES: AtomicU64 = AtomicU64::new(0);
 
 /// Default GPU memory for the expert cache across all layers, in MiB.
 /// Override with `UZU_EXPERT_CACHE_MB`.
-const DEFAULT_EXPERT_CACHE_MB: u64 = 6144;
+const DEFAULT_EXPERT_CACHE_MB: u64 = 8192;
 
 struct ExpertCache<B: Backend> {
     file: File,
@@ -210,6 +210,13 @@ impl<B: Backend> PagedMoeBlock<B> {
         let slots = context.create_buffer(slot_count * record_size).map_err(MoeBlockError::BackendError)?;
         let file = File::open(&config.experts_file)
             .map_err(|error| invalid(format!("cannot open {}: {error}", config.experts_file)))?;
+        // Optionally bypass the OS file cache so RAM is not spent on a second copy of experts
+        // that already sit in the GPU cache.
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("UZU_PAGED_NOCACHE").is_some() {
+            use std::os::fd::AsRawFd;
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+        }
 
         let expert_bytes = |offset: u64, size: usize| offset as usize..offset as usize + size;
         let (d, h) = (model_dim as usize, config.expert_hidden_dim as usize);
