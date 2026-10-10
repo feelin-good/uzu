@@ -256,14 +256,27 @@ impl CommandBufferEncoding for MetalCommandBufferEncoding {
         }
         drop(sparse_state_locked);
 
-        let (sender, receiver) = mpsc::channel();
+        // Spin briefly, then yield, instead of sleeping on a channel: this is on the critical
+        // path of every paged MoE layer and thread wake-up latency dominates otherwise.
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let error_slot = Arc::new(parking_lot::Mutex::new(None::<String>));
+        let (done_handler, error_handler) = (done.clone(), error_slot.clone());
         let feedback_handler = move |feedback: &ProtocolObject<dyn MTL4CommitFeedback>| {
-            let _ = sender.send(feedback.error().map(|error| error.to_string()));
+            *error_handler.lock() = feedback.error().map(|error| error.to_string());
+            done_handler.store(true, std::sync::atomic::Ordering::Release);
         };
         let options = MTL4CommitOptions::new();
         options.add_feedback_handler(&MTL4CommitFeedbackHandler::new(feedback_handler));
         self.context.command_queue.commit_with_options(&[&self.command_buffer], &options);
-        if let Some(error) = receiver.recv().map_err(MetalError::CommandBufferWait)? {
+        let spin_started = std::time::Instant::now();
+        while !done.load(std::sync::atomic::Ordering::Acquire) {
+            if spin_started.elapsed() < Duration::from_micros(200) {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        if let Some(error) = error_slot.lock().take() {
             return Err(MetalError::CommandBufferExecution(error));
         }
 

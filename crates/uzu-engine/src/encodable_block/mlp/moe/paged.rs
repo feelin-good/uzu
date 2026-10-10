@@ -13,7 +13,13 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
-use std::{collections::HashMap, fs::File, ops::Range};
+use std::{
+    collections::HashMap,
+    fs::File,
+    ops::Range,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 
 use half::bf16;
 use parking_lot::Mutex;
@@ -39,6 +45,12 @@ use crate::{
     },
     parameters::ParameterTree,
 };
+
+/// Time spent across all paged layers since the last stats line, in nanoseconds.
+static SYNC_NS: AtomicU64 = AtomicU64::new(0);
+static IO_NS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static PASSES: AtomicU64 = AtomicU64::new(0);
 
 /// Default GPU memory for the expert cache across all layers, in MiB.
 /// Override with `UZU_EXPERT_CACHE_MB`.
@@ -319,6 +331,7 @@ impl<B: Backend> Mlp<B> for PagedMoeBlock<B> {
         batch_dim: u32,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<B::ScratchBuffer, B::Error> {
+        let started = Instant::now();
         command_buffer.push_debug_group(&self.name);
         let (tokens, d, k) = (batch_dim as usize, self.model_dim as usize, self.top_k as usize);
         let k_total = k + 1;
@@ -351,7 +364,9 @@ impl<B: Backend> Mlp<B> for PagedMoeBlock<B> {
         )?;
 
         // 2. Read them back and route on the CPU.
+        let sync_started = Instant::now();
         command_buffer.flush_and_wait()?;
+        SYNC_NS.fetch_add(sync_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let logits = (&routing.logits).as_slice::<bf16>();
         let mut per_expert: Vec<Vec<(u32, u32)>> = vec![Vec::new(); self.num_experts as usize];
         let mut probs = vec![bf16::ZERO; tokens * k_total];
@@ -409,6 +424,7 @@ impl<B: Backend> Mlp<B> for PagedMoeBlock<B> {
         cache.unpin_all();
         let record_size = cache.record_size;
         for (expert, rows) in &expert_rows {
+            let io_started = Instant::now();
             let slot = match cache.acquire(*expert).map_err(|error| panic!("expert read failed: {error}"))? {
                 Some(slot) => slot,
                 None => {
@@ -417,6 +433,7 @@ impl<B: Backend> Mlp<B> for PagedMoeBlock<B> {
                     cache.acquire(*expert).map_err(|error| panic!("expert read failed: {error}"))?.unwrap()
                 },
             };
+            IO_NS.fetch_add(io_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let m = rows.len() as u32;
             let base = slot * record_size;
             let mut fused_up =
@@ -466,13 +483,21 @@ impl<B: Backend> Mlp<B> for PagedMoeBlock<B> {
         }
         if std::env::var_os("UZU_PAGED_STATS").is_some() && cache.file_base == 0 {
             let total = cache.hits + cache.misses;
+            let passes = PASSES.swap(0, Ordering::Relaxed).max(1) as f64;
+            let ms = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed) as f64 / 1e6 / passes;
             eprintln!(
-                "[paged moe] layer 0 cache: {} slots, hit rate {:.1}% ({} hits / {} misses)",
+                "[paged moe] layer 0 cache: {} slots, hit rate {:.1}% ({} hits / {} misses) | per pass: moe {:.1} ms, sync {:.1} ms, io {:.1} ms",
                 cache.slot_count,
                 100.0 * cache.hits as f64 / total.max(1) as f64,
                 cache.hits,
-                cache.misses
+                cache.misses,
+                ms(&TOTAL_NS),
+                ms(&SYNC_NS),
+                ms(&IO_NS),
             );
+        }
+        if cache.file_base == 0 {
+            PASSES.fetch_add(1, Ordering::Relaxed);
         }
         drop(cache);
 
@@ -489,6 +514,7 @@ impl<B: Backend> Mlp<B> for PagedMoeBlock<B> {
             command_buffer,
         );
         command_buffer.pop_debug_group();
+        TOTAL_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(output)
     }
 }
