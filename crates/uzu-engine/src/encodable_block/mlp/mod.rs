@@ -5,7 +5,7 @@ mod moe;
 pub use dense::DenseMlp;
 use derive_more::Debug;
 use gate_act_mul::MlpGateActMulEncodable;
-pub use moe::{MoeBlock, MoeBlockError};
+pub use moe::{MoeBlock, MoeBlockError, PagedMoeBlock};
 use thiserror::Error;
 
 use crate::{
@@ -89,6 +89,10 @@ impl<B: Backend> dyn Mlp<B> {
                     data_type,
                     parameter_tree,
                 )?),
+                None,
+            )),
+            AnyMLPConfig::PagedMixtureOfExpertsConfig(paged_config) => Ok((
+                Box::new(PagedMoeBlock::new(name, context, paged_config, model_dimension, data_type, parameter_tree)?),
                 None,
             )),
         }

@@ -3,11 +3,13 @@
 mod experts_two_pass_decode;
 mod experts_two_pass_prefill;
 mod gather;
+mod paged;
 
 use derive_more::Debug;
 use experts_two_pass_decode::MoeExpertsTwoPassDecodeBlock;
 use experts_two_pass_prefill::{MoeExpertsTwoPassArguments, MoeExpertsTwoPassPrefillBlock};
 use gather::MoeGather;
+pub use paged::PagedMoeBlock;
 use thiserror::Error;
 
 use crate::{

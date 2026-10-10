@@ -25,19 +25,33 @@ from safetensors.torch import save_file
 
 PAGE = 16384
 PREFIX = "language_model."
-# Order of the parts inside one expert record. The runtime reads them by offset,
-# so this list (and the offsets written to experts.json) is the contract.
+# Parts of one expert record, already in uzu's MLXSpec layout (verified byte-for-byte
+# against lalamo's export of the shared expert):
+#   weights: MLX packed bytes unchanged, up and gate concatenated (up first)
+#   scales/biases: MLX [out, in/group] transposed to [in/group, out]
+# The runtime reads parts by the offsets written to experts.json.
 EXPERT_PARTS = [
-    ("up_proj", "weight"),
-    ("up_proj", "scales"),
-    ("up_proj", "biases"),
-    ("gate_proj", "weight"),
-    ("gate_proj", "scales"),
-    ("gate_proj", "biases"),
-    ("down_proj", "weight"),
-    ("down_proj", "scales"),
-    ("down_proj", "biases"),
+    "up_projection.weights",
+    "up_projection.scales",
+    "up_projection.biases",
+    "down_projection.weights",
+    "down_projection.scales",
+    "down_projection.biases",
 ]
+
+
+def expert_parts(t: dict[tuple[str, str], torch.Tensor], expert: int) -> dict[str, torch.Tensor]:
+    def cat(key: str) -> torch.Tensor:
+        return torch.cat([t[("up_proj", key)][expert], t[("gate_proj", key)][expert]])
+
+    return {
+        "up_projection.weights": cat("weight").contiguous().view(torch.uint8),
+        "up_projection.scales": cat("scales").T.contiguous(),
+        "up_projection.biases": cat("biases").T.contiguous(),
+        "down_projection.weights": t[("down_proj", "weight")][expert].contiguous().view(torch.uint8),
+        "down_projection.scales": t[("down_proj", "scales")][expert].T.contiguous(),
+        "down_projection.biases": t[("down_proj", "biases")][expert].T.contiguous(),
+    }
 
 
 def read_header(path: Path) -> tuple[dict, int]:
@@ -58,7 +72,7 @@ def dequantize(weight: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor,
     return out.reshape(*weight.shape[:-1], -1).to(torch.bfloat16)
 
 
-def main(src: Path, out: Path) -> None:
+def main(src: Path, out: Path, experts_only: bool = False) -> None:
     config = json.loads((src / "config.json").read_text())
     text = dict(config.get("text_config", config))
     quant = config["quantization"]
@@ -76,6 +90,14 @@ def main(src: Path, out: Path) -> None:
         with safe_open(where[name], framework="pt") as f:
             return f.get_tensor(name)
 
+    if not experts_only:
+        write_dense_and_extra(src, out, config, text, quant, where, get)
+    write_experts(out, text, quant, get)
+
+
+def write_dense_and_extra(src, out, config, text, quant, where, get) -> None:
+    group, bits = quant["group_size"], quant["bits"]
+    num_layers = text["num_hidden_layers"]
     dense_dir = out / "dense"
     dense_dir.mkdir(parents=True, exist_ok=True)
 
@@ -122,26 +144,32 @@ def main(src: Path, out: Path) -> None:
             )
     save_file(extra, str(out / "moe_extra.safetensors"))
 
-    # 3. Routed experts: one page-aligned record per (layer, expert).
+
+def write_experts(out, text, quant, get) -> None:
+    """Routed experts: one page-aligned record per (layer, expert), uzu layout."""
+    num_layers, num_experts = text["num_hidden_layers"], text["num_experts"]
+    group, bits = quant["group_size"], quant["bits"]
     layout = None
     record_size = None
     with (out / "experts.bin").open("wb") as f:
         for layer in range(num_layers):
             base = f"{PREFIX}model.layers.{layer}.mlp.switch_mlp."
-            tensors = {(p, k): get(f"{base}{p}.{k}") for p, k in EXPERT_PARTS}
-            if layout is None:
-                layout, offset = [], 0
-                for p, k in EXPERT_PARTS:
-                    t = tensors[(p, k)][0]
-                    size = t.numel() * t.element_size()
-                    layout.append({"name": f"{p}.{k}", "offset": offset, "size": size,
-                                   "dtype": str(t.dtype).removeprefix("torch."), "shape": list(t.shape)})
-                    offset = (offset + size + 255) // 256 * 256
-                record_size = (offset + PAGE - 1) // PAGE * PAGE
+            tensors = {(p, k): get(f"{base}{p}.{k}")
+                       for p in ("up_proj", "gate_proj", "down_proj") for k in ("weight", "scales", "biases")}
             for expert in range(num_experts):
+                parts = expert_parts(tensors, expert)
+                if layout is None:
+                    layout, offset = [], 0
+                    for name in EXPERT_PARTS:
+                        t = parts[name]
+                        size = t.numel() * t.element_size()
+                        layout.append({"name": name, "offset": offset, "size": size,
+                                       "dtype": str(t.dtype).removeprefix("torch."), "shape": list(t.shape)})
+                        offset = (offset + size + 255) // 256 * 256
+                    record_size = (offset + PAGE - 1) // PAGE * PAGE
                 record = bytearray(record_size)
-                for entry, (p, k) in zip(layout, EXPERT_PARTS):
-                    raw = tensors[(p, k)][expert].contiguous().view(torch.uint8).numpy().tobytes()
+                for entry in layout:
+                    raw = parts[entry["name"]].view(torch.uint8).numpy().tobytes()
                     assert len(raw) == entry["size"]
                     record[entry["offset"]:entry["offset"] + len(raw)] = raw
                 f.write(record)
@@ -161,4 +189,4 @@ def main(src: Path, out: Path) -> None:
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]), Path(sys.argv[2]))
+    main(Path(sys.argv[1]), Path(sys.argv[2]), experts_only="--experts-only" in sys.argv[3:])

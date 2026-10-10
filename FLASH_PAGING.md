@@ -30,8 +30,22 @@ token ──► attention / DeltaNet (resident)
      - The router and shared-expert gate, dequantized to bf16.
      - `experts.bin`, with one page-aligned 4-bit record per (layer, expert).
   2. `stage_lalamo.py` runs Mirai's lalamo on the dense view, giving a normal uzu model.
-  3. Finalize (to do): rewrite each MLP config to `PagedMixtureOfExpertsConfig` and attach the router, gate and expert file.
-- **Runtime** (to do): `PagedMoeBlock`, plus a `flush_and_wait` on the command-buffer encoding so the forward pass can stop at each router and page in experts.
+  3. `stage_finalize.py` rewrites each MLP config to `PagedMixtureOfExpertsConfig`, renames the shared-expert tensors and adds the router weights (256 router rows plus 1 shared-gate row, bf16).
+- **Runtime**:
+  - `encodable_block/mlp/moe/paged.rs` holds `PagedMoeBlock`. It needs no new GPU kernels: it reuses the matmul, gated-activation, MoE gather and MoE finalize kernels.
+  - `CommandBufferEncoding::flush_and_wait` is implemented for Metal and CPU. It commits mid-forward and keeps the constant and scratch allocations alive.
+  - The cache size comes from `UZU_EXPERT_CACHE_MB` (default 6144) and is split evenly across layers. `UZU_PAGED_STATS=1` prints layer 0's hit rate.
+
+### Converting and running
+
+```bash
+L=<lalamo checkout>/.venv/bin/python
+$L tools/flash_paging/stage_split.py <mlx-community/Qwen3.6-35B-A3B-4bit dir> <out>
+$L tools/flash_paging/stage_lalamo.py <out>
+echo '{"name": "qwen3.5", "type": "hanashi"}' > <out>/uzu/encoding.json
+$L tools/flash_paging/stage_finalize.py <out>
+cargo run --release -p cli -- --model <out>/model
+```
 
 ## Changelog
 
@@ -39,6 +53,7 @@ token ──► attention / DeltaNet (resident)
 |---|---|
 | 2026-10-09 | Restored MoE kernels (revert of upstream #886 "Burn MoE"); 44 MoE unit tests pass on M4 |
 | 2026-10-10 | Converter stages 1–2. The dense skeleton (1.37 GB) loads and generates in uzu. Its output is meaningless until the routed experts are wired in. |
+| 2026-10-10 | `flush_and_wait`, `PagedMixtureOfExpertsConfig`, `PagedMoeBlock` and converter stage 3. **The 35B runs on the GPU from an 18.1 GB expert file and answers correctly.** First numbers with a cold cache: about 5 tok/s generation, 7.45 GB memory. |
 
 ## Baselines on the same Mac (M4, 16 GB)
 

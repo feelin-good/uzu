@@ -237,6 +237,51 @@ impl CommandBufferEncoding for MetalCommandBufferEncoding {
         }
     }
 
+    fn flush_and_wait(&mut self) -> Result<(), MetalError> {
+        self.compute_encoder.barrier_after_stages_before_queue_stages_visibility_options(
+            MTLStages::Dispatch | MTLStages::Blit,
+            MTLStages::Dispatch | MTLStages::Blit | MTLStages::ResourceState,
+            MTL4VisibilityOptions::Device,
+        );
+        self.compute_encoder.end_encoding();
+        self.command_buffer.end_command_buffer();
+
+        let mut sparse_state_locked = self.context.sparse_state.lock();
+        if sparse_state_locked.did_ops {
+            sparse_state_locked.did_ops = false;
+            sparse_state_locked.event_value += 1;
+            let value = sparse_state_locked.event_value;
+            self.context.sparse_queue.signal_event_value(&self.context.sparse_event, value);
+            self.context.command_queue.wait_for_event_value(&self.context.sparse_event, value);
+        }
+        drop(sparse_state_locked);
+
+        let (sender, receiver) = mpsc::channel();
+        let feedback_handler = move |feedback: &ProtocolObject<dyn MTL4CommitFeedback>| {
+            let _ = sender.send(feedback.error().map(|error| error.to_string()));
+        };
+        let options = MTL4CommitOptions::new();
+        options.add_feedback_handler(&MTL4CommitFeedbackHandler::new(feedback_handler));
+        self.context.command_queue.commit_with_options(&[&self.command_buffer], &options);
+        if let Some(error) = receiver.recv().map_err(MetalError::CommandBufferWait)? {
+            return Err(MetalError::CommandBufferExecution(error));
+        }
+
+        // The GPU is idle now, so the allocator can be reset and reused for the next chunk.
+        self.command_allocator.reset();
+        self.command_buffer.begin_command_buffer_with_allocator(&self.command_allocator);
+        self.compute_encoder = self.command_buffer.compute_command_encoder().unwrap();
+        self.compute_encoder.barrier_after_queue_stages_before_stages_visibility_options(
+            MTLStages::Dispatch | MTLStages::Blit | MTLStages::ResourceState,
+            MTLStages::Dispatch | MTLStages::Blit,
+            MTL4VisibilityOptions::Device,
+        );
+        self.compute_encoder.set_argument_table(Some(&self.argument_table));
+        self.reads.clear();
+        self.writes.clear();
+        Ok(())
+    }
+
     fn end_encoding(mut self) -> <Self::CommandBuffer as CommandBuffer>::Executable {
         let constant_allocator = self.constant_allocator.take().unwrap();
         assert!(constant_allocator.is_done(), "attempted to end encoding while constants are still alive");

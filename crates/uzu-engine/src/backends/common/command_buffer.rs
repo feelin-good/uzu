@@ -89,6 +89,11 @@ pub trait CommandBufferEncoding {
 
     fn sample_end_timestamp(&mut self);
 
+    /// Submits everything encoded so far, waits for it to finish and keeps encoding into a
+    /// fresh command buffer. Constant and scratch allocations stay valid across the flush.
+    /// Used by flash paging to read router results on the CPU in the middle of a forward pass.
+    fn flush_and_wait(&mut self) -> Result<(), <<Self::CommandBuffer as CommandBuffer>::Backend as Backend>::Error>;
+
     fn end_encoding(self) -> <Self::CommandBuffer as CommandBuffer>::Executable;
 }
 

@@ -148,6 +148,23 @@ impl CommandBufferEncoding for CpuCommandBufferEncoding {
         }
     }
 
+    fn flush_and_wait(&mut self) -> Result<(), CpuError> {
+        let commands = std::mem::take(&mut self.commands);
+        let (sender, receiver) = mpsc::channel();
+        self.context
+            .command_queue
+            .send(Box::new(move || {
+                for command in commands {
+                    if let CpuCommand::Run(run) = command {
+                        run();
+                    }
+                }
+                let _ = sender.send(());
+            }))
+            .unwrap();
+        Ok(receiver.recv()?)
+    }
+
     fn end_encoding(self) -> CpuCommandBufferExecutable {
         assert!(self.constant_allocator.is_done(), "attempted to end encoding while constants are still alive");
         CpuCommandBufferExecutable {
